@@ -62,6 +62,7 @@
   <label>track <select id="mode"><option value="face">face</option><option value="bullseye">bullseye</option></select></label>
   <label><input type="checkbox" id="invx" checked> invert X</label>
   <label><input type="checkbox" id="invy"> invert Y</label>
+  <label><input type="checkbox" id="autofire" checked> auto-fire</label>
   <span class="readout" id="readout">pan=90 tilt=90</span>
 </div>
 <div class="bar">
@@ -76,8 +77,8 @@
 import { FaceDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
 // Same limits as project_turrent.ino
-const X_MIN = 20, X_MAX = 160;
-const Y_MIN = 40, Y_MAX = 130;
+const X_MIN = 30, X_MAX = 150;
+const Y_MIN = 50, Y_MAX = 120;
 const SEND_HZ = 30;
 const SMOOTH = 0.15;   // 0..1, higher = snappier, lower = smoother
 const DEADBAND = 3;    // degrees; ignore aim changes smaller than this (stops jitter)
@@ -86,7 +87,7 @@ const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
 const status = msg => { $("status").textContent = msg; };
 
-const state = { fx: 0.5, fy: 0.5, fire: false, face: null, ax: 90, ay: 90 };
+const state = { fx: 0.5, fy: 0.5, fire: false, manualFire: false, face: null, ax: 90, ay: 90 };
 let detector = null, port = null, writer = null, writing = false, lastSend = 0;
 
 // ---------- voice callouts ----------
@@ -299,6 +300,7 @@ async function detectBullseye() {
     const cx = d[bi], cy = d[n + bi], w = d[2 * n + bi], h = d[3 * n + bi];
     state.face = { originX: (cx - w / 2 - px) / s, originY: (cy - h / 2 - py) / s, width: w / s, height: h / s };
     aimAt(state.face);
+    trackMotion(state.face);
   } catch (e) {
     status("Bullseye model error: " + e.message);
   } finally {
@@ -352,7 +354,7 @@ function draw(ax, ay) {
   ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI * 2); ctx.stroke();
 
   $("stage").classList.toggle("firing", state.fire);
-  $("readout").textContent = `pan=${ax} tilt=${ay}  ${state.fire ? "MOTORS ON" : "motors off"}${track.phase === "locked" ? "  LOCKED" : state.face ? "" : "  (no target)"}`;
+  $("readout").textContent = `pan=${ax} tilt=${ay}  ${state.fire ? "MOTORS ON" : "motors off"}${track.phase === "locked" ? "  LOCKED" : state.face ? "" : "  (no target)"}${autoStatus(performance.now())}`;
 }
 
 // ---------- serial ----------
@@ -397,8 +399,53 @@ async function disconnect(recenter) {
   status("Disconnected. Servos centered, motors off.");
 }
 
+// ---------- auto-fire (bullseye mode) ----------
+// The bullseye moves for 3+ s, then holds still for 2 s -> fire for 2 s.
+// After that (or after a stop that came too soon) it has to move again to re-arm.
+const AUTO_MOVE_MS = 3000, AUTO_STILL_MS = 2000, AUTO_FIRE_MS = 2000;
+const MOVING_SPEED = 0.15;   // frame-widths per second; faster than this counts as moving
+const STILL_SPEED = 0.05;    // slower than this counts as still (normal detection jitter sits below it)
+const auto = { last: null, speed: 0, movedMs: 0, stillSince: 0, fireUntil: 0, lastSeen: 0 };
+
+function trackMotion(box) {
+  const now = performance.now(), vw = video.videoWidth;
+  const c = { x: (box.originX + box.width / 2) / vw, y: (box.originY + box.height / 2) / vw, t: now };
+  if (auto.last && now - auto.last.t < 500) {
+    const v = Math.hypot(c.x - auto.last.x, c.y - auto.last.y) / ((now - auto.last.t) / 1000);
+    auto.speed += (v - auto.speed) * 0.5;   // smooth out detection jitter
+    if (auto.speed > MOVING_SPEED) { auto.movedMs += now - auto.last.t; auto.stillSince = 0; }
+    else if (auto.speed < STILL_SPEED) { if (!auto.stillSince) auto.stillSince = now; }
+    else auto.stillSince = 0;
+  }
+  auto.last = c;
+  auto.lastSeen = now;
+}
+
+function updateAutoFire(now) {
+  const on = $("autofire").checked && $("mode").value === "bullseye";
+  if (!on || now - auto.lastSeen > LOST_MS) {   // off, or the bullseye is gone: start over
+    Object.assign(auto, { last: null, speed: 0, movedMs: 0, stillSince: 0 });
+    if (!on) auto.fireUntil = 0;
+    return;
+  }
+  if (auto.stillSince && now - auto.stillSince >= AUTO_STILL_MS) {
+    if (auto.movedMs >= AUTO_MOVE_MS) auto.fireUntil = now + AUTO_FIRE_MS;
+    auto.movedMs = 0;
+    auto.stillSince = 0;
+  }
+}
+
+function autoStatus(now) {
+  if (!$("autofire").checked || $("mode").value !== "bullseye") return "";
+  if (now < auto.fireUntil) return "  AUTO FIRE";
+  if (auto.movedMs >= AUTO_MOVE_MS)
+    return auto.stillSince ? `  firing in ${((AUTO_STILL_MS - (now - auto.stillSince)) / 1000).toFixed(1)}s` : "  ARMED";
+  if (auto.movedMs > 0) return `  moving ${(auto.movedMs / 1000).toFixed(1)}s`;
+  return "";
+}
+
 // ---------- fire controls ----------
-const setFire = on => { state.fire = on; $("fire").classList.toggle("on", on); };
+const setFire = on => { state.manualFire = on; };
 $("fire").addEventListener("pointerdown", e => { $("fire").setPointerCapture(e.pointerId); setFire(true); });
 $("fire").addEventListener("pointerup", () => setFire(false));
 $("fire").addEventListener("pointercancel", () => setFire(false));
@@ -411,6 +458,9 @@ function loop() {
   detect();
   const [ax, ay] = angles();
   const now = performance.now();
+  updateAutoFire(now);
+  state.fire = state.manualFire || now < auto.fireUntil;
+  $("fire").classList.toggle("on", state.fire);
   if (now - lastSend >= 1000 / SEND_HZ) {
     send(`${ax},${ay},${state.fire ? 1 : 0}\n`);
     lastSend = now;
