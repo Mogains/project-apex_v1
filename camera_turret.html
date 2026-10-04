@@ -70,6 +70,8 @@
 </div>
 <div class="status" id="status">Start the camera, then connect the Arduino.</div>
 
+<script src="voice/lines.js"></script>      <!-- voice lines + saved MP3s, made by voice/make_voice.py -->
+<script src="elevenlabs_key.js"></script>   <!-- optional, gitignored: window.ELEVENLABS_KEY = "sk_..." -->
 <script type="module">
 import { FaceDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
@@ -87,28 +89,41 @@ const status = msg => { $("status").textContent = msg; };
 const state = { fx: 0.5, fy: 0.5, fire: false, face: null, ax: 90, ay: 90 };
 let detector = null, port = null, writer = null, writing = false, lastSend = 0;
 
-// ---------- voice callouts (ElevenLabs, falls back to the built-in Mac voice) ----------
-const VOICE_ID = "JBFqnCBsd6RMkjVDRZzb";   // any voice ID from your ElevenLabs voice library
+// ---------- voice callouts ----------
+// Lines and their saved MP3s come from voice/lines.js (made by voice/make_voice.py — edit lines there).
+// Saved MP3s cost nothing to play. A line without one is spoken live with ElevenLabs if there's a key,
+// otherwise with the built-in Mac voice.
+const VOICE_ID = "JBFqnCBsd6RMkjVDRZzb";   // keep in sync with voice/make_voice.py
 const VOICE_MODEL = "eleven_flash_v2_5";
-const LOCK_MS = 1200;    // face held this long -> "locked on target"
-const LOST_MS = 1500;    // face gone this long -> "target lost"
+const LOCK_MS = 1200;    // target held this long -> "locked"
+const LOST_MS = 1500;    // target gone this long -> "lost"
 const FIRE_COOLDOWN_MS = 3000;
-const LINES = {
-  acquired: "Target acquired.",
-  locked: "Locked on target.",
-  lost: "Target lost.",
-  firing: "Firing.",
+const IDLE_MIN_MS = 25000, IDLE_MAX_MS = 45000;   // a random idle quip this often while nothing is in view
+
+const FALLBACK_LINES = {
+  any: { startup: ["Apex online."], idle: [] },
+  face: { acquired: ["Human detected."], locked: ["Human locked in."], lost: ["Human lost."], firing: ["Firing."] },
+  bullseye: { acquired: ["Bullseye detected."], locked: ["Bullseye locked in."], lost: ["Bullseye lost."], firing: ["Firing."] },
 };
+const LINES = window.VOICE_LINES || Object.fromEntries(Object.entries(FALLBACK_LINES).map(([mode, events]) =>
+  [mode, Object.fromEntries(Object.entries(events).map(([ev, texts]) => [ev, texts.map(text => ({ text }))]))]));
+
+// a random line for this event, in the current mode (or "any")
+function line(event, mode = $("mode").value) {
+  const list = LINES[mode]?.[event] || [];
+  return list[Math.floor(Math.random() * list.length)];
+}
 
 // key is kept in this browser only
-try { $("elkey").value = localStorage.getItem("elevenlabs_key") || ""; } catch {}
+$("elkey").value = window.ELEVENLABS_KEY || "";
+try { $("elkey").value = localStorage.getItem("elevenlabs_key") || $("elkey").value; } catch {}
 $("elkey").addEventListener("change", () => {
   try { localStorage.setItem("elevenlabs_key", $("elkey").value.trim()); } catch {}
   audioCache.clear();
 });
 
-const audioCache = new Map();   // text -> Promise<blob url>, so each line is only generated once
-let speaking = false;
+const audioCache = new Map();   // text -> Promise<blob url>, so a live line is only generated once per session
+let speaking = false, pendingLine = null, lastTalk = 0;
 
 function elevenAudio(text) {
   if (!audioCache.has(text)) {
@@ -126,16 +141,26 @@ function elevenAudio(text) {
   return audioCache.get(text);
 }
 
-async function say(text) {
-  if (!$("voice").checked || speaking) return;   // never talk over itself
+const playAudio = src => new Promise(res => {
+  const a = new Audio(src);
+  a.onended = a.onerror = res;
+  a.play().catch(res);
+});
+
+async function say(entry) {
+  if (!entry || !$("voice").checked) return;
+  // never talk over itself: keep only the newest line and say it next
+  if (speaking) { pendingLine = entry; return; }
   speaking = true;
+  lastTalk = performance.now();
   try {
-    if ($("elkey").value.trim()) {
-      const audio = new Audio(await elevenAudio(text));
-      await new Promise(res => { audio.onended = audio.onerror = res; audio.play().catch(res); });
+    if (entry.file) {
+      await playAudio(entry.file);
+    } else if ($("elkey").value.trim()) {
+      await playAudio(await elevenAudio(entry.text));
     } else {
       await new Promise(res => {
-        const u = new SpeechSynthesisUtterance(text);
+        const u = new SpeechSynthesisUtterance(entry.text);
         u.onend = u.onerror = res;
         speechSynthesis.speak(u);
       });
@@ -144,21 +169,27 @@ async function say(text) {
     status("Voice error: " + e.message);
   } finally {
     speaking = false;
+    lastTalk = performance.now();
+    if (pendingLine) { const next = pendingLine; pendingLine = null; say(next); }
   }
 }
 
-const track = { phase: "idle", seenSince: 0, lastSeen: 0, wasFiring: false, lastFireCall: 0 };
+const track = { phase: "idle", seenSince: 0, lastSeen: 0, wasFiring: false, lastFireCall: 0, idleGap: IDLE_MIN_MS };
 
 function callouts(now) {
   if (state.face) {
-    if (track.phase === "idle") { track.phase = "acquired"; track.seenSince = now; say(LINES.acquired); }
-    else if (track.phase === "acquired" && now - track.seenSince >= LOCK_MS) { track.phase = "locked"; say(LINES.locked); }
+    if (track.phase === "idle") { track.phase = "acquired"; track.seenSince = now; say(line("acquired")); }
+    else if (track.phase === "acquired" && now - track.seenSince >= LOCK_MS) { track.phase = "locked"; say(line("locked")); }
     track.lastSeen = now;
   } else if (track.phase !== "idle" && now - track.lastSeen >= LOST_MS) {
-    track.phase = "idle"; say(LINES.lost);
+    track.phase = "idle"; say(line("lost"));
+  } else if (track.phase === "idle" && !speaking && now - lastTalk >= track.idleGap) {
+    track.idleGap = IDLE_MIN_MS + Math.random() * (IDLE_MAX_MS - IDLE_MIN_MS);
+    say(line("idle", "any"));
+    lastTalk = now;
   }
   if (state.fire && !track.wasFiring && now - track.lastFireCall >= FIRE_COOLDOWN_MS) {
-    track.lastFireCall = now; say(LINES.firing);
+    track.lastFireCall = now; say(line("firing"));
   }
   track.wasFiring = state.fire;
 }
@@ -166,7 +197,6 @@ function callouts(now) {
 // ---------- camera + face detection ----------
 $("cam").onclick = async () => {
   $("cam").disabled = true;
-  if ($("elkey").value.trim()) Object.values(LINES).forEach(t => elevenAudio(t).catch(e => status("Voice error: " + e.message)));
   try {
     status("Loading face model...");
     const vision = await FilesetResolver.forVisionTasks(
@@ -184,6 +214,7 @@ $("cam").onclick = async () => {
       video: { width: 640, height: 480, facingMode: "user" }, audio: false });
     await video.play();
     status(port ? "Tracking." : "Tracking. Connect the Arduino to move the turret.");
+    say(line("startup", "any"));
     requestAnimationFrame(loop);
   } catch (e) {
     $("cam").disabled = false;
@@ -279,6 +310,7 @@ try { $("mode").value = localStorage.getItem("track_mode") || "face"; } catch {}
 $("mode").addEventListener("change", async () => {
   try { localStorage.setItem("track_mode", $("mode").value); } catch {}
   state.face = null;
+  track.phase = "idle";   // start fresh, without announcing "lost"
   if ($("mode").value === "bullseye") {
     try { await loadYolo(); status("Tracking bullseye."); }
     catch (e) { status("Couldn't load " + BULLSEYE_MODEL + ": " + e.message); $("mode").value = "face"; }

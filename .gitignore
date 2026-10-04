@@ -10,3 +10,4 @@ training/train.log
 training/real/
 training/test_videos/
 training/backgrounds/
+elevenlabs_key.js
