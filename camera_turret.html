@@ -6,9 +6,7 @@
   Hold SPACE / hold FIRE  -> DC motors (D5) spin
   Disconnect              -> servos recenter, motors off
 
-  Needs Chrome or Edge (Web Serial). Serve it from localhost so the camera + serial are allowed:
-    cd /Users/anmolbhatt/cusro && python3 -m http.server 8000
-  then open http://localhost:8000/camera_turret.html
+  Needs Chrome or Edge (Web Serial). Just double-click this file in Finder — no server needed.
 -->
 <html lang="en">
 <head>
@@ -40,6 +38,10 @@
   button:disabled { opacity: .5; cursor: default; }
   #fire { background: #3a1416; border-color: var(--fire); user-select: none; touch-action: none; }
   #fire.on { background: var(--fire); color: #000; }
+  select { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+           border-radius: 6px; padding: 6px 8px; font: inherit; }
+  input[type=password] { flex: 1; min-width: 200px; background: var(--panel); color: var(--text);
+           border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit; }
   label { color: var(--muted); display: flex; align-items: center; gap: 4px; }
   .readout { font-family: ui-monospace, Menlo, monospace; margin-left: auto; }
   .status { width: 100%; max-width: 720px; margin-top: 8px; color: var(--muted); font-size: 13px; }
@@ -57,9 +59,14 @@
   <button id="cam">Start camera</button>
   <button id="connect">Connect Arduino</button>
   <button id="fire">FIRE (hold / space)</button>
+  <label>track <select id="mode"><option value="face">face</option><option value="bullseye">bullseye</option></select></label>
   <label><input type="checkbox" id="invx" checked> invert X</label>
   <label><input type="checkbox" id="invy"> invert Y</label>
   <span class="readout" id="readout">pan=90 tilt=90</span>
+</div>
+<div class="bar">
+  <label><input type="checkbox" id="voice" checked> voice</label>
+  <input type="password" id="elkey" placeholder="ElevenLabs API key (optional)" autocomplete="off">
 </div>
 <div class="status" id="status">Start the camera, then connect the Arduino.</div>
 
@@ -80,9 +87,86 @@ const status = msg => { $("status").textContent = msg; };
 const state = { fx: 0.5, fy: 0.5, fire: false, face: null, ax: 90, ay: 90 };
 let detector = null, port = null, writer = null, writing = false, lastSend = 0;
 
+// ---------- voice callouts (ElevenLabs, falls back to the built-in Mac voice) ----------
+const VOICE_ID = "JBFqnCBsd6RMkjVDRZzb";   // any voice ID from your ElevenLabs voice library
+const VOICE_MODEL = "eleven_flash_v2_5";
+const LOCK_MS = 1200;    // face held this long -> "locked on target"
+const LOST_MS = 1500;    // face gone this long -> "target lost"
+const FIRE_COOLDOWN_MS = 3000;
+const LINES = {
+  acquired: "Target acquired.",
+  locked: "Locked on target.",
+  lost: "Target lost.",
+  firing: "Firing.",
+};
+
+// key is kept in this browser only
+try { $("elkey").value = localStorage.getItem("elevenlabs_key") || ""; } catch {}
+$("elkey").addEventListener("change", () => {
+  try { localStorage.setItem("elevenlabs_key", $("elkey").value.trim()); } catch {}
+  audioCache.clear();
+});
+
+const audioCache = new Map();   // text -> Promise<blob url>, so each line is only generated once
+let speaking = false;
+
+function elevenAudio(text) {
+  if (!audioCache.has(text)) {
+    const p = fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}?output_format=mp3_44100_128`, {
+      method: "POST",
+      headers: { "xi-api-key": $("elkey").value.trim(), "Content-Type": "application/json" },
+      body: JSON.stringify({ text, model_id: VOICE_MODEL }),
+    }).then(async r => {
+      if (!r.ok) throw new Error(`ElevenLabs ${r.status}: ${(await r.text()).slice(0, 120)}`);
+      return URL.createObjectURL(await r.blob());
+    });
+    p.catch(() => audioCache.delete(text));   // retry next time instead of caching the failure
+    audioCache.set(text, p);
+  }
+  return audioCache.get(text);
+}
+
+async function say(text) {
+  if (!$("voice").checked || speaking) return;   // never talk over itself
+  speaking = true;
+  try {
+    if ($("elkey").value.trim()) {
+      const audio = new Audio(await elevenAudio(text));
+      await new Promise(res => { audio.onended = audio.onerror = res; audio.play().catch(res); });
+    } else {
+      await new Promise(res => {
+        const u = new SpeechSynthesisUtterance(text);
+        u.onend = u.onerror = res;
+        speechSynthesis.speak(u);
+      });
+    }
+  } catch (e) {
+    status("Voice error: " + e.message);
+  } finally {
+    speaking = false;
+  }
+}
+
+const track = { phase: "idle", seenSince: 0, lastSeen: 0, wasFiring: false, lastFireCall: 0 };
+
+function callouts(now) {
+  if (state.face) {
+    if (track.phase === "idle") { track.phase = "acquired"; track.seenSince = now; say(LINES.acquired); }
+    else if (track.phase === "acquired" && now - track.seenSince >= LOCK_MS) { track.phase = "locked"; say(LINES.locked); }
+    track.lastSeen = now;
+  } else if (track.phase !== "idle" && now - track.lastSeen >= LOST_MS) {
+    track.phase = "idle"; say(LINES.lost);
+  }
+  if (state.fire && !track.wasFiring && now - track.lastFireCall >= FIRE_COOLDOWN_MS) {
+    track.lastFireCall = now; say(LINES.firing);
+  }
+  track.wasFiring = state.fire;
+}
+
 // ---------- camera + face detection ----------
 $("cam").onclick = async () => {
   $("cam").disabled = true;
+  if ($("elkey").value.trim()) Object.values(LINES).forEach(t => elevenAudio(t).catch(e => status("Voice error: " + e.message)));
   try {
     status("Loading face model...");
     const vision = await FilesetResolver.forVisionTasks(
@@ -94,6 +178,7 @@ $("cam").onclick = async () => {
       },
       runningMode: "VIDEO",
     });
+    if ($("mode").value === "bullseye") await loadYolo();
     status("Starting camera...");
     video.srcObject = await navigator.mediaDevices.getUserMedia({
       video: { width: 640, height: 480, facingMode: "user" }, audio: false });
@@ -107,7 +192,9 @@ $("cam").onclick = async () => {
 };
 
 function detect() {
-  if (!detector || video.readyState < 2) return;
+  if (video.readyState < 2) return;
+  if ($("mode").value === "bullseye") return detectBullseye();   // async, aims when it finishes
+  if (!detector) return;
   const res = detector.detectForVideo(video, performance.now());
   // pick the biggest face
   let best = null;
@@ -116,14 +203,87 @@ function detect() {
     if (!best || b.width * b.height > best.width * best.height) best = b;
   }
   state.face = best;
-  if (!best) return;   // no face -> hold last aim
+  if (best) aimAt(best);   // no face -> hold last aim
+}
+
+function aimAt(box) {
   const vw = video.videoWidth, vh = video.videoHeight;
   // mirror x so it matches what you see on screen
-  const tx = 1 - (best.originX + best.width / 2) / vw;
-  const ty = (best.originY + best.height / 2) / vh;
+  const tx = 1 - (box.originX + box.width / 2) / vw;
+  const ty = (box.originY + box.height / 2) / vh;
   state.fx += (tx - state.fx) * SMOOTH;
   state.fy += (ty - state.fy) * SMOOTH;
 }
+
+// ---------- bullseye detection (your trained YOLO model, run in the browser) ----------
+// the model is packed into a .js file (by training/export.py) so the page works opened straight from disk
+const BULLSEYE_MODEL = "models/bullseye.js";
+const BULLSEYE_CONF = 0.45;                      // raise if it locks onto things that aren't the target
+const YOLO_SIZE = 640;
+const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
+let yolo = null, yoloBusy = false;
+const prep = Object.assign(document.createElement("canvas"), { width: YOLO_SIZE, height: YOLO_SIZE });
+const pctx = prep.getContext("2d", { willReadFrequently: true });
+
+async function loadYolo() {
+  if (yolo) return;
+  status("Loading bullseye model...");
+  const ort = await import(ORT_URL + "ort.webgpu.min.mjs");
+  ort.env.wasm.wasmPaths = ORT_URL;
+  await new Promise((res, rej) => {
+    const s = Object.assign(document.createElement("script"), { src: BULLSEYE_MODEL, onload: res });
+    s.onerror = () => rej(new Error("missing " + BULLSEYE_MODEL + " — run training/export.py"));
+    document.head.append(s);
+  });
+  const bytes = Uint8Array.from(atob(window.BULLSEYE_ONNX_B64), c => c.charCodeAt(0));
+  const session = await ort.InferenceSession.create(bytes, { executionProviders: ["webgpu", "wasm"] });
+  yolo = { ort, session };
+}
+
+async function detectBullseye() {
+  if (!yolo || yoloBusy) return;   // one inference at a time; the page keeps drawing meanwhile
+  yoloBusy = true;
+  try {
+    // letterbox the frame into a 640x640 square, same as training
+    const vw = video.videoWidth, vh = video.videoHeight, s = YOLO_SIZE / Math.max(vw, vh);
+    const px = (YOLO_SIZE - vw * s) / 2, py = (YOLO_SIZE - vh * s) / 2;
+    pctx.fillStyle = "rgb(114,114,114)";
+    pctx.fillRect(0, 0, YOLO_SIZE, YOLO_SIZE);
+    pctx.drawImage(video, px, py, vw * s, vh * s);
+    const rgba = pctx.getImageData(0, 0, YOLO_SIZE, YOLO_SIZE).data;
+    const N = YOLO_SIZE * YOLO_SIZE, input = new Float32Array(3 * N);
+    for (let i = 0; i < N; i++) {
+      input[i] = rgba[i * 4] / 255;
+      input[i + N] = rgba[i * 4 + 1] / 255;
+      input[i + 2 * N] = rgba[i * 4 + 2] / 255;
+    }
+    const { ort, session } = yolo;
+    const feeds = { [session.inputNames[0]]: new ort.Tensor("float32", input, [1, 3, YOLO_SIZE, YOLO_SIZE]) };
+    const out = (await session.run(feeds))[session.outputNames[0]];
+    // output is [1, 5, n]: rows are cx, cy, w, h, score — keep the most confident box
+    const d = out.data, n = out.dims[2];
+    let bi = -1, bs = BULLSEYE_CONF;
+    for (let i = 0; i < n; i++) if (d[4 * n + i] > bs) { bs = d[4 * n + i]; bi = i; }
+    if (bi < 0) { state.face = null; return; }
+    const cx = d[bi], cy = d[n + bi], w = d[2 * n + bi], h = d[3 * n + bi];
+    state.face = { originX: (cx - w / 2 - px) / s, originY: (cy - h / 2 - py) / s, width: w / s, height: h / s };
+    aimAt(state.face);
+  } catch (e) {
+    status("Bullseye model error: " + e.message);
+  } finally {
+    yoloBusy = false;
+  }
+}
+
+try { $("mode").value = localStorage.getItem("track_mode") || "face"; } catch {}
+$("mode").addEventListener("change", async () => {
+  try { localStorage.setItem("track_mode", $("mode").value); } catch {}
+  state.face = null;
+  if ($("mode").value === "bullseye") {
+    try { await loadYolo(); status("Tracking bullseye."); }
+    catch (e) { status("Couldn't load " + BULLSEYE_MODEL + ": " + e.message); $("mode").value = "face"; }
+  }
+});
 
 function angles() {
   const { fx, fy } = state;
@@ -160,7 +320,7 @@ function draw(ax, ay) {
   ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI * 2); ctx.stroke();
 
   $("stage").classList.toggle("firing", state.fire);
-  $("readout").textContent = `pan=${ax} tilt=${ay}  ${state.fire ? "MOTORS ON" : "motors off"}${state.face ? "" : "  (no face)"}`;
+  $("readout").textContent = `pan=${ax} tilt=${ay}  ${state.fire ? "MOTORS ON" : "motors off"}${track.phase === "locked" ? "  LOCKED" : state.face ? "" : "  (no target)"}`;
 }
 
 // ---------- serial ----------
@@ -223,6 +383,7 @@ function loop() {
     send(`${ax},${ay},${state.fire ? 1 : 0}\n`);
     lastSend = now;
   }
+  callouts(now);
   draw(ax, ay);
   requestAnimationFrame(loop);
 }

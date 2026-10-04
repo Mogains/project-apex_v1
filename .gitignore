@@ -1,3 +1,12 @@
 __pycache__/
 *.pt
 .DS_Store
+training/dataset/
+training/runs/
+training/check_photo.jpg
+training/bullseye_template.jpg
+training/train.log
+.vscode/
+training/real/
+training/test_videos/
+training/backgrounds/
