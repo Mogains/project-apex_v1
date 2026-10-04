@@ -94,7 +94,7 @@ let detector = null, port = null, writer = null, writing = false, lastSend = 0;
 // Lines and their saved MP3s come from voice/lines.js (made by voice/make_voice.py — edit lines there).
 // Saved MP3s cost nothing to play. A line without one is spoken live with ElevenLabs if there's a key,
 // otherwise with the built-in Mac voice.
-const VOICE_ID = "JBFqnCBsd6RMkjVDRZzb";   // keep in sync with voice/make_voice.py
+const VOICE_ID = "N2lVS1w4EtoT3dr4eOWO";   // keep in sync with voice/make_voice.py
 const VOICE_MODEL = "eleven_flash_v2_5";
 const LOCK_MS = 1200;    // target held this long -> "locked"
 const LOST_MS = 1500;    // target gone this long -> "lost"
@@ -358,44 +358,93 @@ function draw(ax, ay) {
 }
 
 // ---------- serial ----------
+// If the Arduino drops off USB or stops responding (motor noise can do that), keep retrying
+// the same port in the background until it's back, instead of giving up.
+const enc = new TextEncoder();
+let wantConnected = false, reconnecting = false, portInfo = null, writeStart = 0;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function openPort(p) {
+  await p.open({ baudRate: 115200 });
+  port = p;
+  writer = p.writable.getWriter();
+  await sleep(2000);   // Uno resets when the port opens
+}
+
+async function closePort() {
+  const p = port, w = writer;
+  port = null; writer = null;
+  try { await w?.abort(); } catch {}
+  try { w?.releaseLock(); } catch {}
+  try { await Promise.race([p?.close(), sleep(500)]); } catch {}
+}
+
 async function send(line) {
-  if (!writer || writing) return;   // drop frames instead of queueing a backlog
+  if (!writer) return;
+  if (writing) {   // drop frames instead of queueing a backlog — but a write stuck for 1 s means it's hung
+    if (performance.now() - writeStart > 1000) lostConnection("not responding");
+    return;
+  }
   writing = true;
-  try { await writer.write(new TextEncoder().encode(line)); }
-  catch (e) { status("Serial write failed: " + e.message); await disconnect(false); }
+  writeStart = performance.now();
+  try { await writer.write(enc.encode(line)); }
+  catch (e) { lostConnection(e.message); }
   finally { writing = false; }
 }
 
+async function lostConnection(why) {
+  if (reconnecting || !wantConnected) return;
+  reconnecting = true;
+  await closePort();
+  writing = false;
+  status(`Lost the Arduino (${why}). Reconnecting...`);
+  while (wantConnected) {
+    try {
+      const ports = await navigator.serial.getPorts();
+      const again = ports.find(q => q.getInfo().usbVendorId === portInfo?.usbVendorId &&
+                                    q.getInfo().usbProductId === portInfo?.usbProductId) || ports[0];
+      if (again) {
+        await openPort(again);
+        status("Reconnected to the Arduino.");
+        break;
+      }
+    } catch { await closePort(); }
+    await sleep(1000);
+  }
+  reconnecting = false;
+}
+
+navigator.serial?.addEventListener("disconnect", e => { if (port && e.target === port) lostConnection("unplugged"); });
+
 $("connect").onclick = async () => {
-  if (port) return disconnect(true);
+  if (wantConnected) return disconnect(true);
   if (!("serial" in navigator)) return status("Web Serial not supported — use Chrome or Edge.");
   try {
-    port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 115200 });
-    writer = port.writable.getWriter();
+    const p = await navigator.serial.requestPort();
+    portInfo = p.getInfo();
+    wantConnected = true;
     status("Connected. Waiting for the Arduino to reset...");
-    await new Promise(r => setTimeout(r, 2000));   // Uno resets when the port opens
+    await openPort(p);
     $("connect").textContent = "Disconnect";
     status(detector ? "Tracking." : "Connected. Start the camera.");
   } catch (e) {
-    port = null; writer = null;
+    wantConnected = false;
+    await closePort();
     status("Connect failed: " + e.message);
   }
 };
 
 async function disconnect(recenter) {
-  const p = port, w = writer;
-  port = null; writer = null;
+  wantConnected = false;   // also stops any reconnect attempts
   $("connect").textContent = "Connect Arduino";
   try {
-    if (recenter && w) {
-      while (writing) await new Promise(r => setTimeout(r, 5));
-      await w.write(new TextEncoder().encode("90,90,0\n"));
-      await new Promise(r => setTimeout(r, 300));
+    if (recenter && writer) {
+      while (writing && performance.now() - writeStart < 1000) await sleep(5);
+      await writer.write(enc.encode("90,90,0\n"));
+      await sleep(300);
     }
-    w?.releaseLock();
-    await p?.close();
   } catch {}
+  await closePort();
   status("Disconnected. Servos centered, motors off.");
 }
 

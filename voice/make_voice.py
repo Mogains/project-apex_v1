@@ -14,7 +14,7 @@ import re
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"     # "George" — any voice ID from your ElevenLabs voice library
+VOICE_ID = "N2lVS1w4EtoT3dr4eOWO"     # "Callum - Husky Trickster" — any voice ID from your ElevenLabs voice library
 MODEL = "eleven_multilingual_v2"      # best-sounding model; we only pay for each line once
 
 LINES = {

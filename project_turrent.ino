@@ -5,6 +5,7 @@
 //   D5  = DC motors (PWM, through the 220 ohm resistor to the MOSFET gate)
 // Servos and motors run from their OWN battery packs. All grounds tied together.
 #include <Servo.h>
+#include <avr/wdt.h>
 
 const uint8_t PIN_X = 8;
 const uint8_t PIN_Y = 10;
@@ -49,6 +50,7 @@ int moveToward(int cur, int tgt, int step) {
 }
 
 void setup() {
+  wdt_disable();
   Serial.begin(115200);
   pinMode(PIN_WHEELS, OUTPUT);
   analogWrite(PIN_WHEELS, 0);
@@ -56,9 +58,12 @@ void setup() {
   yServo.attach(PIN_Y);
   xServo.write(curX);
   yServo.write(curY);
+  // if motor noise ever freezes the board, the watchdog reboots it within half a second
+  wdt_enable(WDTO_500MS);
 }
 
 void loop() {
+  wdt_reset();
   unsigned long now = millis();
 
   // read "x,y,fire\n"
