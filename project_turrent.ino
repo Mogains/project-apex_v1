@@ -1,13 +1,13 @@
 // Trackpad turret.
 // Reads "x,y,fire\n" over USB serial at 115200 (x, y = whole degrees, fire = 0 or 1).
 //   D8  = X (pan) servo signal
-//   D11 = Y (tilt) servo signal
+//   D10 = Y (tilt) servo signal
 //   D5  = DC motors (through the 220 ohm resistor to the MOSFET gate)
 // Servos and motors run from their OWN battery packs. All grounds tied together.
 #include <Servo.h>
 
 const uint8_t PIN_X = 8;
-const uint8_t PIN_Y = 11;
+const uint8_t PIN_Y = 10;
 const uint8_t PIN_WHEELS = 5;
 
 const int X_MIN = 20, X_MAX = 160;

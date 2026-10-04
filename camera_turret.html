@@ -1,0 +1,231 @@
+<!doctype html>
+<!--
+  Camera turret controller.
+
+  Your face in the camera -> turret aims (X servo D8, Y servo D10)
+  Hold SPACE / hold FIRE  -> DC motors (D5) spin
+  Disconnect              -> servos recenter, motors off
+
+  Needs Chrome or Edge (Web Serial). Serve it from localhost so the camera + serial are allowed:
+    cd /Users/anmolbhatt/cusro && python3 -m http.server 8000
+  then open http://localhost:8000/camera_turret.html
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera Turret</title>
+<style>
+  :root {
+    --bg: #0e0f12; --panel: #17191e; --text: #e8e9ec; --muted: #8a8f98;
+    --line: #2a2d34; --ok: #3ddc84; --fire: #ff4d4d; --accent: #4da3ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; align-items: center; padding: 16px;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .stage { position: relative; width: 100%; max-width: 720px; aspect-ratio: 4 / 3;
+           background: #000; border: 2px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .stage.firing { border-color: var(--fire); box-shadow: 0 0 0 4px rgba(255,77,77,.35); }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  video { object-fit: cover; transform: scaleX(-1); }   /* mirror so it feels natural */
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+         width: 100%; max-width: 720px; margin-top: 12px; }
+  button { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+           border-radius: 6px; padding: 8px 14px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  #fire { background: #3a1416; border-color: var(--fire); user-select: none; touch-action: none; }
+  #fire.on { background: var(--fire); color: #000; }
+  label { color: var(--muted); display: flex; align-items: center; gap: 4px; }
+  .readout { font-family: ui-monospace, Menlo, monospace; margin-left: auto; }
+  .status { width: 100%; max-width: 720px; margin-top: 8px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Camera Turret</h1>
+
+<div class="stage" id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="bar">
+  <button id="cam">Start camera</button>
+  <button id="connect">Connect Arduino</button>
+  <button id="fire">FIRE (hold / space)</button>
+  <label><input type="checkbox" id="invx" checked> invert X</label>
+  <label><input type="checkbox" id="invy"> invert Y</label>
+  <span class="readout" id="readout">pan=90 tilt=90</span>
+</div>
+<div class="status" id="status">Start the camera, then connect the Arduino.</div>
+
+<script type="module">
+import { FaceDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// Same limits as project_turrent.ino
+const X_MIN = 20, X_MAX = 160;
+const Y_MIN = 40, Y_MAX = 130;
+const SEND_HZ = 30;
+const SMOOTH = 0.15;   // 0..1, higher = snappier, lower = smoother
+const DEADBAND = 3;    // degrees; ignore aim changes smaller than this (stops jitter)
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const status = msg => { $("status").textContent = msg; };
+
+const state = { fx: 0.5, fy: 0.5, fire: false, face: null, ax: 90, ay: 90 };
+let detector = null, port = null, writer = null, writing = false, lastSend = 0;
+
+// ---------- camera + face detection ----------
+$("cam").onclick = async () => {
+  $("cam").disabled = true;
+  try {
+    status("Loading face model...");
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    detector = await FaceDetector.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+    });
+    status("Starting camera...");
+    video.srcObject = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: "user" }, audio: false });
+    await video.play();
+    status(port ? "Tracking." : "Tracking. Connect the Arduino to move the turret.");
+    requestAnimationFrame(loop);
+  } catch (e) {
+    $("cam").disabled = false;
+    status("Camera/model error: " + e.message);
+  }
+};
+
+function detect() {
+  if (!detector || video.readyState < 2) return;
+  const res = detector.detectForVideo(video, performance.now());
+  // pick the biggest face
+  let best = null;
+  for (const d of res.detections) {
+    const b = d.boundingBox;
+    if (!best || b.width * b.height > best.width * best.height) best = b;
+  }
+  state.face = best;
+  if (!best) return;   // no face -> hold last aim
+  const vw = video.videoWidth, vh = video.videoHeight;
+  // mirror x so it matches what you see on screen
+  const tx = 1 - (best.originX + best.width / 2) / vw;
+  const ty = (best.originY + best.height / 2) / vh;
+  state.fx += (tx - state.fx) * SMOOTH;
+  state.fy += (ty - state.fy) * SMOOTH;
+}
+
+function angles() {
+  const { fx, fy } = state;
+  // matches touchpad_turret.py
+  const ax = $("invx").checked ? X_MIN + fx * (X_MAX - X_MIN) : X_MAX - fx * (X_MAX - X_MIN);
+  const ay = $("invy").checked ? Y_MIN + fy * (Y_MAX - Y_MIN) : Y_MAX - fy * (Y_MAX - Y_MIN);
+  // only move once the target has drifted past the deadband
+  if (Math.abs(ax - state.ax) >= DEADBAND) state.ax = Math.round(ax);
+  if (Math.abs(ay - state.ay) >= DEADBAND) state.ay = Math.round(ay);
+  return [state.ax, state.ay];
+}
+
+// ---------- drawing ----------
+function draw(ax, ay) {
+  const r = canvas.getBoundingClientRect();
+  if (canvas.width !== r.width || canvas.height !== r.height) { canvas.width = r.width; canvas.height = r.height; }
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // map video coords -> canvas (object-fit: cover + mirror)
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W / vw, H / vh), ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+
+  if (state.face) {
+    const b = state.face;
+    ctx.strokeStyle = "rgba(77,163,255,.8)"; ctx.lineWidth = 2;
+    ctx.strokeRect(W - (ox + (b.originX + b.width) * s), oy + b.originY * s, b.width * s, b.height * s);
+  }
+
+  const x = ox + state.fx * vw * s, y = oy + state.fy * vh * s;
+  ctx.strokeStyle = "rgba(255,255,255,.25)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  ctx.strokeStyle = state.fire ? "#ff4d4d" : "#3ddc84"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI * 2); ctx.stroke();
+
+  $("stage").classList.toggle("firing", state.fire);
+  $("readout").textContent = `pan=${ax} tilt=${ay}  ${state.fire ? "MOTORS ON" : "motors off"}${state.face ? "" : "  (no face)"}`;
+}
+
+// ---------- serial ----------
+async function send(line) {
+  if (!writer || writing) return;   // drop frames instead of queueing a backlog
+  writing = true;
+  try { await writer.write(new TextEncoder().encode(line)); }
+  catch (e) { status("Serial write failed: " + e.message); await disconnect(false); }
+  finally { writing = false; }
+}
+
+$("connect").onclick = async () => {
+  if (port) return disconnect(true);
+  if (!("serial" in navigator)) return status("Web Serial not supported — use Chrome or Edge.");
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    status("Connected. Waiting for the Arduino to reset...");
+    await new Promise(r => setTimeout(r, 2000));   // Uno resets when the port opens
+    $("connect").textContent = "Disconnect";
+    status(detector ? "Tracking." : "Connected. Start the camera.");
+  } catch (e) {
+    port = null; writer = null;
+    status("Connect failed: " + e.message);
+  }
+};
+
+async function disconnect(recenter) {
+  const p = port, w = writer;
+  port = null; writer = null;
+  $("connect").textContent = "Connect Arduino";
+  try {
+    if (recenter && w) {
+      while (writing) await new Promise(r => setTimeout(r, 5));
+      await w.write(new TextEncoder().encode("90,90,0\n"));
+      await new Promise(r => setTimeout(r, 300));
+    }
+    w?.releaseLock();
+    await p?.close();
+  } catch {}
+  status("Disconnected. Servos centered, motors off.");
+}
+
+// ---------- fire controls ----------
+const setFire = on => { state.fire = on; $("fire").classList.toggle("on", on); };
+$("fire").addEventListener("pointerdown", e => { $("fire").setPointerCapture(e.pointerId); setFire(true); });
+$("fire").addEventListener("pointerup", () => setFire(false));
+$("fire").addEventListener("pointercancel", () => setFire(false));
+addEventListener("keydown", e => { if (e.code === "Space") { e.preventDefault(); setFire(true); } });
+addEventListener("keyup", e => { if (e.code === "Space") setFire(false); });
+addEventListener("blur", () => setFire(false));
+
+// ---------- main loop ----------
+function loop() {
+  detect();
+  const [ax, ay] = angles();
+  const now = performance.now();
+  if (now - lastSend >= 1000 / SEND_HZ) {
+    send(`${ax},${ay},${state.fire ? 1 : 0}\n`);
+    lastSend = now;
+  }
+  draw(ax, ay);
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
